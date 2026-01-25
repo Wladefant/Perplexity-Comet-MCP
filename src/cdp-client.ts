@@ -1108,11 +1108,46 @@ export class CometCDPClient {
   }
 
   /**
-   * Capture screenshot
+   * Capture screenshot with page readiness check and validation
    */
   async screenshot(format: "png" | "jpeg" = "png"): Promise<ScreenshotResult> {
     this.ensureConnected();
-    return this.client!.Page.captureScreenshot({ format }) as Promise<ScreenshotResult>;
+
+    // Wait for page to be ready before capturing
+    try {
+      await this.client!.Runtime.evaluate({
+        expression: `
+          new Promise((resolve) => {
+            if (document.readyState === 'complete') {
+              resolve(true);
+            } else {
+              window.addEventListener('load', () => resolve(true), { once: true });
+              setTimeout(() => resolve(true), 3000); // Fallback timeout
+            }
+          })
+        `,
+        awaitPromise: true,
+        timeout: 5000,
+      });
+    } catch {
+      // Continue anyway - page might still be usable
+    }
+
+    // Small delay to ensure rendering is complete
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const result = await this.client!.Page.captureScreenshot({
+      format,
+      captureBeyondViewport: false,
+    });
+
+    if (!result || !result.data) {
+      throw new Error(
+        "Screenshot returned empty data. Ensure you're connected to a visible tab with content."
+      );
+    }
+
+    return { data: result.data };
   }
 
   /**
