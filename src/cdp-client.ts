@@ -660,7 +660,7 @@ export class CometCDPClient {
 
     let mainTarget: CDPTarget | null = null;
 
-    // If we have a saved main tab, verify it's still a non-sidecar Perplexity page
+    // Reuse the saved tab only if it's still alive (handles reconnects within the same session)
     if (this.automationMainTabId) {
       const saved = pageTargets.find(t => t.id === this.automationMainTabId);
       if (saved && this.isPerplexityUrl(saved.url) && !saved.url.includes('sidecar')) {
@@ -669,13 +669,7 @@ export class CometCDPClient {
     }
 
     if (!mainTarget) {
-      // Prefer non-sidecar Perplexity pages (the main search page, not the copilot panel)
-      mainTarget = pageTargets.find(t => this.isPerplexityUrl(t.url) && !t.url.includes('sidecar')) || null;
-    }
-
-    if (!mainTarget) {
-      // Open a new Perplexity tab (don't use the sidecar as control tab)
-      console.error(`[comet] No main Perplexity tab found among ${pageTargets.length} pages; opening new tab`);
+      // Always open a fresh tab — never hijack an existing user tab
       mainTarget = await this.newTab(url);
       await new Promise(resolve => setTimeout(resolve, 2200));
     }
