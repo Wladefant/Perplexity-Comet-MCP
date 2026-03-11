@@ -2,9 +2,10 @@
 // Modified for Windows/WSL support
 
 import CDP from "chrome-remote-interface";
-import { spawn, ChildProcess, execSync } from "child_process";
-import { platform } from "os";
+import { spawn, ChildProcess, execSync, execFileSync } from "child_process";
+import { platform, homedir } from "os";
 import { existsSync } from "fs";
+import path from "path";
 import type {
   CDPTarget,
   CDPVersion,
@@ -143,7 +144,91 @@ function getCometPath(): string {
 
 const COMET_PATH = getCometPath();
 const IS_WINDOWS = platform() === "win32" || IS_WSL;
-const DEFAULT_PORT = 9223;
+const DEFAULT_PORT = Number.parseInt(process.env.COMET_PORT || "9223", 10) || 9223;
+const DEFAULT_AUTOMATION_PROFILE = "ClaudeAutomation";
+
+type ProfileMode = 'isolated' | 'default';
+
+function getProfileMode(): ProfileMode {
+  return process.env.COMET_PROFILE_MODE === 'default' ? 'default' : 'isolated';
+}
+
+function getProfileModeLabel(): string {
+  return getProfileMode() === 'default' ? 'default-profile' : 'isolated';
+}
+
+function getDefaultAutomationUserDataDir(): string {
+  if (platform() === "darwin") {
+    return path.join(homedir(), "Library", "Application Support", "Perplexity", "Comet-Claude-Automation");
+  }
+
+  if (platform() === "win32" || IS_WSL) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(homedir(), "AppData", "Local");
+    return path.join(localAppData, "Perplexity", "Comet", "ClaudeAutomation");
+  }
+
+  return path.join(homedir(), ".config", "perplexity-comet-claude-automation");
+}
+
+function getDefaultProfileUserDataDir(): string {
+  if (platform() === "darwin") {
+    return path.join(homedir(), "Library", "Application Support", "Perplexity", "Comet", "User Data");
+  }
+
+  if (platform() === "win32" || IS_WSL) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(homedir(), "AppData", "Local");
+    return path.join(localAppData, "Perplexity", "Comet", "User Data");
+  }
+
+  return path.join(homedir(), ".config", "Perplexity", "Comet", "User Data");
+}
+
+function getDefaultProfileDir(): string {
+  return "Default";
+}
+
+function getAutomationUserDataDir(): string {
+  if (getProfileMode() === 'default') {
+    return getDefaultProfileUserDataDir();
+  }
+
+  return process.env.COMET_USER_DATA_DIR || getDefaultAutomationUserDataDir();
+}
+
+function getAutomationProfileDir(): string {
+  if (getProfileMode() === 'default') {
+    return getDefaultProfileDir();
+  }
+
+  return process.env.COMET_PROFILE_DIR || DEFAULT_AUTOMATION_PROFILE;
+}
+
+function getCometLaunchArgs(port: number, restoreSession: boolean = false): string[] {
+  if (getProfileMode() === 'default') {
+    // Default-profile mode: no user-data-dir/profile-directory so we use the user's logged-in profile.
+    // When restarting an existing Comet, --restore-last-session preserves open tabs.
+    const args = [
+      `--remote-debugging-port=${port}`,
+      "--new-window",
+    ];
+    if (restoreSession) {
+      args.push("--restore-last-session");
+    }
+    return args;
+  }
+
+  // Isolated mode: separate profile directory for automation
+  return [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${getAutomationUserDataDir()}`,
+    `--profile-directory=${getAutomationProfileDir()}`,
+    "--new-window",
+  ];
+}
+
+function formatAutomationDescriptor(port: number): string {
+  return `mode=${getProfileModeLabel()} port=${port} profile=${getAutomationProfileDir()} userDataDir=${getAutomationUserDataDir()}`;
+}
 
 export class CometCDPClient {
   private client: CDP.Client | null = null;
@@ -152,7 +237,12 @@ export class CometCDPClient {
     connected: false,
     port: DEFAULT_PORT,
   };
+  private automationMainTabId: string | undefined;
   private lastTargetId: string | undefined;
+
+  private isPerplexityUrl(url: string | undefined): boolean {
+    return Boolean(url && url.includes('perplexity.ai'));
+  }
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 10;
   private isReconnecting: boolean = false;
@@ -163,6 +253,8 @@ export class CometCDPClient {
 
   // Tab context registry for multi-tab workflow awareness
   private tabRegistry: Map<string, TabContext> = new Map();
+  // Tabs that existed before the MCP session started (pre-existing user tabs)
+  private baselineTabIds: Set<string> = new Set();
 
   get isConnected(): boolean {
     return this.state.connected && this.client !== null;
@@ -328,7 +420,6 @@ export class CometCDPClient {
     this.state.connected = false;
     this.client = null;
 
-    // Verify Comet is running
     try {
       await this.getVersion();
     } catch {
@@ -336,11 +427,10 @@ export class CometCDPClient {
         await this.startComet(this.state.port);
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch {
-        throw new Error('Cannot connect to Comet. Ensure Comet is running with --remote-debugging-port=9222');
+        throw new Error(`Cannot connect to Comet automation on debug port ${this.state.port}`);
       }
     }
 
-    // Try to reconnect to last target
     if (this.lastTargetId) {
       try {
         const targets = await this.listTargets();
@@ -350,16 +440,29 @@ export class CometCDPClient {
       } catch { /* target gone */ }
     }
 
-    // Find best target
-    const targets = await this.listTargets();
-    const target = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai')) ||
-                   targets.find(t => t.type === 'page' && t.url !== 'about:blank');
-
-    if (target) {
-      return await this.connect(target.id);
+    if (this.automationMainTabId) {
+      try {
+        const targets = await this.listTargets();
+        if (targets.find(t => t.id === this.automationMainTabId)) {
+          return await this.connect(this.automationMainTabId);
+        }
+      } catch { /* target gone */ }
     }
 
-    throw new Error('No suitable tab found for reconnection');
+    const targets = await this.listTargets();
+    const pageTargets = targets.filter(t => t.type === 'page');
+    const activeTarget = pageTargets.find(t => t.id === this.state.activeTabId);
+    if (activeTarget) {
+      return await this.connect(activeTarget.id);
+    }
+
+    const nonInternalTarget = pageTargets.find(t => !this.isInternalTab(t.url));
+    if (nonInternalTarget) {
+      return await this.connect(nonInternalTarget.id);
+    }
+
+    const target = await this.ensureAutomationPerplexityTab();
+    return `Connected to tab: ${target.url}`;
   }
 
   /**
@@ -373,31 +476,310 @@ export class CometCDPClient {
     others: CDPTarget[];
   }> {
     const targets = await this.listTargets();
+    const pageTargets = targets.filter(t => t.type === 'page');
+    const mainTarget = this.automationMainTabId
+      ? pageTargets.find(t => t.id === this.automationMainTabId) || null
+      : null;
+    const scopedMain = mainTarget || pageTargets.find(t =>
+      this.isPerplexityUrl(t.url) && !t.url.includes('sidecar')
+    ) || null;
 
     return {
-      main: targets.find(t =>
-        t.type === 'page' && t.url.includes('perplexity.ai') && !t.url.includes('sidecar')
+      main: scopedMain,
+      sidecar: pageTargets.find(t =>
+        t.url.includes('sidecar')
       ) || null,
-      sidecar: targets.find(t =>
-        t.type === 'page' && t.url.includes('sidecar')
-      ) || null,
-      agentBrowsing: targets.find(t =>
-        t.type === 'page' &&
-        !t.url.includes('perplexity.ai') &&
-        !t.url.includes('chrome-extension') &&
-        !t.url.includes('chrome://') &&
-        t.url !== 'about:blank'
+      agentBrowsing: pageTargets.find(t =>
+        t.id !== scopedMain?.id &&
+        !this.isInternalTab(t.url) &&
+        !this.isPerplexityUrl(t.url) &&
+        !this.baselineTabIds.has(t.id) // Only report tabs opened during this session
       ) || null,
       overlay: targets.find(t =>
         t.url.includes('chrome-extension') && t.url.includes('overlay')
       ) || null,
-      others: targets.filter(t =>
-        t.type === 'page' &&
-        !t.url.includes('perplexity.ai') &&
+      others: pageTargets.filter(t =>
+        t.id !== scopedMain?.id &&
         !t.url.includes('chrome-extension')
       ),
     };
   }
+
+  getAutomationConfig(): { port: number; profileMode: string; userDataDir: string; profileDir: string } {
+    return {
+      port: this.state.port,
+      profileMode: getProfileModeLabel(),
+      userDataDir: getAutomationUserDataDir(),
+      profileDir: getAutomationProfileDir(),
+    };
+  }
+
+  private async connectToPort(port: number): Promise<CDP.Client> {
+    const connectPort = await getWSLConnectPort(port);
+    return CDP({ port: connectPort, host: '127.0.0.1' });
+  }
+
+  private async isDebugPortReachable(port: number): Promise<boolean> {
+    try {
+      const client = await this.connectToPort(port);
+      await client.close();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async waitForDebugPort(port: number, startDelayMs: number = 1500): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, startDelayMs));
+
+    const maxAttempts = 40;
+    for (let attempts = 0; attempts < maxAttempts; attempts++) {
+      if (await this.isDebugPortReachable(port)) {
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    throw new Error(`Timeout waiting for Comet on debug port ${port}. Try running: "${COMET_PATH}" ${getCometLaunchArgs(port).join(' ')}`);
+  }
+
+  private getWindowsProcessCommandLines(): string[] {
+    try {
+      const output = execFileSync('powershell.exe', [
+        '-NoProfile',
+        '-Command',
+        'Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "comet.exe" } | Select-Object -ExpandProperty CommandLine'
+      ], {
+        encoding: 'utf8',
+        timeout: 10000,
+        windowsHide: true,
+      });
+
+      return output
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  private async isExpectedAutomationInstance(port: number): Promise<boolean> {
+    const portArg = `--remote-debugging-port=${port}`;
+
+    if (IS_WINDOWS) {
+      const commandLines = this.getWindowsProcessCommandLines();
+      return commandLines.some(commandLine => {
+        if (!commandLine.includes(portArg)) {
+          return false;
+        }
+
+        if (getProfileMode() === 'default') {
+          // Default-profile mode: just match on the debug port (no user-data-dir in args)
+          return true;
+        }
+
+        const userDataDirArg = `--user-data-dir=${getAutomationUserDataDir()}`;
+        const profileDirArg = `--profile-directory=${getAutomationProfileDir()}`;
+        return commandLine.includes(userDataDirArg) && commandLine.includes(profileDirArg);
+      });
+    }
+
+    return false;
+  }
+
+  private async getBrowserCommandLine(port: number): Promise<string[] | null> {
+    try {
+      const client = await this.connectToPort(port);
+      try {
+        const result = await (client as any).Browser.getBrowserCommandLine();
+        return Array.isArray(result?.arguments) ? result.arguments : null;
+      } finally {
+        await client.close();
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private async findRunningAutomationPort(startPort: number): Promise<number | null> {
+    let candidate = startPort;
+    for (let attempts = 0; attempts < 20; attempts++, candidate++) {
+      if (!await this.isDebugPortReachable(candidate)) {
+        continue;
+      }
+
+      if (await this.isExpectedAutomationInstance(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  private async findAvailableDebugPort(startPort: number): Promise<number> {
+    let candidate = startPort;
+    for (let attempts = 0; attempts < 20; attempts++, candidate++) {
+      if (!await this.isDebugPortReachable(candidate)) {
+        return candidate;
+      }
+    }
+
+    throw new Error(`Could not find an available Comet debug port starting at ${startPort}`);
+  }
+
+  private async launchCometProcess(port: number, restoreSession: boolean = false): Promise<void> {
+    const args = getCometLaunchArgs(port, restoreSession);
+
+    if (IS_WSL) {
+      const cometPath = COMET_PATH;
+      const escapedArgs = args.map(arg => `'${arg.replace(/'/g, "''")}'`).join(', ');
+      const psCommand = `Set-Location C:\\; Start-Process -FilePath '${cometPath.replace(/'/g, "''")}' -ArgumentList @(${escapedArgs})`;
+      spawn('powershell.exe', ['-NoProfile', '-Command', psCommand], {
+        detached: true,
+        stdio: 'ignore',
+      }).unref();
+      return;
+    }
+
+    this.cometProcess = spawn(COMET_PATH, args, {
+      detached: true,
+      stdio: "ignore",
+      shell: true,
+    });
+    this.cometProcess.on('error', (err) => {
+      console.error(`[comet] Failed to launch Comet process: ${err.message}`);
+    });
+    this.cometProcess.unref();
+  }
+
+  async ensureAutomationPerplexityTab(url: string = "https://www.perplexity.ai/"): Promise<CDPTarget> {
+    const targets = await this.listTargets();
+    const pageTargets = targets.filter(t => t.type === 'page');
+
+    let mainTarget: CDPTarget | null = null;
+
+    // If we have a saved main tab, verify it's still a non-sidecar Perplexity page
+    if (this.automationMainTabId) {
+      const saved = pageTargets.find(t => t.id === this.automationMainTabId);
+      if (saved && this.isPerplexityUrl(saved.url) && !saved.url.includes('sidecar')) {
+        mainTarget = saved;
+      }
+    }
+
+    if (!mainTarget) {
+      // Prefer non-sidecar Perplexity pages (the main search page, not the copilot panel)
+      mainTarget = pageTargets.find(t => this.isPerplexityUrl(t.url) && !t.url.includes('sidecar')) || null;
+    }
+
+    if (!mainTarget) {
+      // Open a new Perplexity tab (don't use the sidecar as control tab)
+      console.error(`[comet] No main Perplexity tab found among ${pageTargets.length} pages; opening new tab`);
+      mainTarget = await this.newTab(url);
+      await new Promise(resolve => setTimeout(resolve, 2200));
+    }
+
+    this.automationMainTabId = mainTarget.id;
+    await this.connect(mainTarget.id);
+
+    if (!this.isPerplexityUrl(mainTarget.url)) {
+      await this.navigate(url, true);
+      await new Promise(resolve => setTimeout(resolve, 1800));
+      const refreshedTargets = await this.listTargets();
+      mainTarget = refreshedTargets.find(t => t.id === this.automationMainTabId) || mainTarget;
+    }
+
+    // Record baseline tabs (pre-existing user tabs) on first setup
+    if (this.baselineTabIds.size === 0) {
+      for (const t of pageTargets) {
+        this.baselineTabIds.add(t.id);
+      }
+    }
+
+    this.setTabPurpose(mainTarget.id, 'main');
+    return mainTarget;
+  }
+
+  async connectToAutomationMainTab(): Promise<CDPTarget> {
+    const mainTarget = await this.ensureAutomationPerplexityTab();
+    this.automationMainTabId = mainTarget.id;
+    return mainTarget;
+  }
+
+  async getAutomationMainTab(): Promise<CDPTarget | null> {
+    if (!this.automationMainTabId) {
+      return null;
+    }
+
+    const targets = await this.listTargets();
+    return targets.find(t => t.id === this.automationMainTabId) || null;
+  }
+
+  async connectToLastActiveTab(): Promise<boolean> {
+    const targets = await this.listTargets();
+    const pageTargets = targets.filter(t => t.type === 'page');
+
+    const preferredTarget = [
+      this.lastTargetId,
+      this.state.activeTabId,
+      pageTargets.find(t => !this.isInternalTab(t.url))?.id,
+      this.automationMainTabId,
+    ].filter((id): id is string => Boolean(id)).find(id => pageTargets.some(t => t.id === id));
+
+    if (!preferredTarget) {
+      return false;
+    }
+
+    await this.connect(preferredTarget);
+    return true;
+  }
+
+  async withAutomationMainTab<T>(operation: () => Promise<T>): Promise<T> {
+    const previousTargetId = this.state.activeTabId ?? this.lastTargetId;
+    await this.connectToAutomationMainTab();
+
+    try {
+      return await operation();
+    } finally {
+      if (previousTargetId && previousTargetId !== this.automationMainTabId) {
+        try {
+          const targets = await this.listTargets();
+          if (targets.some(t => t.id === previousTargetId)) {
+            await this.connect(previousTargetId);
+          }
+        } catch {
+          // Keep control tab connection if restoring the previous tab fails
+        }
+      }
+    }
+  }
+
+  async getVisibleTabContexts(): Promise<TabContext[]> {
+    const tabs = await this.getTabContexts();
+    return tabs.filter(t => !this.isInternalTab(t.url));
+  }
+
+  async forceRestartComet(port: number = this.state.port): Promise<string> {
+    this.state.port = port;
+    await this.killComet();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await this.launchCometProcess(port);
+    await this.waitForDebugPort(port);
+    return `Comet force-restarted on mode=${getProfileModeLabel()} port ${port}`;
+  }
+
+  getAutomationMainTabId(): string | undefined {
+    return this.automationMainTabId;
+  }
+
+  setAutomationMainTabId(tabId: string | undefined): void {
+    this.automationMainTabId = tabId;
+  }
+
+  /**
+   * Ensure we're connected to the main Perplexity tab
+   * Used during agentic browsing when Comet may open new tabs
+   */
 
   /**
    * Ensure we're connected to the main Perplexity tab
@@ -405,50 +787,16 @@ export class CometCDPClient {
    */
   async ensureOnPerplexityTab(): Promise<boolean> {
     try {
-      // First check if current connection is valid and on Perplexity
-      if (this.client) {
-        try {
-          const urlResult = await this.client.Runtime.evaluate({
-            expression: 'window.location.href',
-            timeout: 2000
-          });
-          const currentUrl = urlResult.result.value as string;
-          if (currentUrl?.includes('perplexity.ai')) {
-            return true; // Already on Perplexity tab
-          }
-        } catch {
-          // Current connection is stale, continue to reconnect
-        }
-      }
-
-      // Find and connect to Perplexity main tab
-      const tabs = await this.listTabsCategorized();
-      if (tabs.main) {
-        await this.connect(tabs.main.id);
-        this.invalidateHealthCache();
-        return true;
-      }
-
-      // Fallback: find any Perplexity tab
-      const targets = await this.listTargets();
-      const perplexityTab = targets.find(t =>
-        t.type === 'page' && t.url.includes('perplexity.ai')
-      );
-
-      if (perplexityTab) {
-        await this.connect(perplexityTab.id);
-        this.invalidateHealthCache();
-        return true;
-      }
-
-      return false;
+      await this.connectToAutomationMainTab();
+      this.invalidateHealthCache();
+      return true;
     } catch {
       return false;
     }
   }
 
   /**
-   * Check if we're currently connected to the Perplexity tab
+   * Check if we're currently connected to the Perplexity control tab
    */
   async isOnPerplexityTab(): Promise<boolean> {
     if (!this.client) return false;
@@ -458,10 +806,51 @@ export class CometCDPClient {
         timeout: 2000
       });
       const url = result.result.value as string;
-      return url?.includes('perplexity.ai') || false;
+      return this.isPerplexityUrl(url) && (!this.automationMainTabId || this.state.activeTabId === this.automationMainTabId);
     } catch {
       return false;
     }
+  }
+
+  async isAutomationMainTab(targetId: string | undefined): Promise<boolean> {
+    return Boolean(targetId && this.automationMainTabId && targetId === this.automationMainTabId);
+  }
+
+  async getActiveTabContext(): Promise<TabContext | null> {
+    const tabs = await this.getTabContexts();
+    const activeTabId = this.state.activeTabId ?? this.lastTargetId;
+    return tabs.find(tab => tab.id === activeTabId) || null;
+  }
+
+  async getBrowsingTabCount(): Promise<number> {
+    const tabs = await this.getVisibleTabContexts();
+    return tabs.length;
+  }
+
+  async getClosableTabCount(): Promise<number> {
+    const tabs = await this.getVisibleTabContexts();
+    return tabs.filter(tab => tab.id !== this.automationMainTabId).length;
+  }
+
+  async isControlTabAvailable(): Promise<boolean> {
+    return Boolean(await this.getAutomationMainTab());
+  }
+
+  async closeTrackedTab(targetId: string): Promise<boolean> {
+    const success = await this.closeTab(targetId);
+    if (success) {
+      this.tabRegistry.delete(targetId);
+      if (this.automationMainTabId === targetId) {
+        this.automationMainTabId = undefined;
+      }
+      if (this.lastTargetId === targetId) {
+        this.lastTargetId = undefined;
+      }
+      if (this.state.activeTabId === targetId) {
+        this.state.activeTabId = undefined;
+      }
+    }
+    return success;
   }
 
   // ============ TAB REGISTRY METHODS ============
@@ -482,30 +871,21 @@ export class CometCDPClient {
    * Check if URL is an internal Chrome/Comet page (not a real browsing tab)
    */
   private isInternalTab(url: string): boolean {
-    // Chrome internal pages
-    if (url.startsWith('chrome://') ||
-        url.startsWith('chrome-extension://') ||
-        url.startsWith('devtools://') ||
-        url === 'about:blank' ||
-        url === '') {
-      return true;
-    }
-
-    // ALL Perplexity URLs are internal Comet UI, not real browsing tabs
-    if (url.includes('perplexity.ai')) {
-      return true;
-    }
-
-    return false;
+    return url.startsWith('chrome://') ||
+      url.startsWith('chrome-extension://') ||
+      url.startsWith('devtools://') ||
+      url === 'about:blank' ||
+      url === '';
   }
 
   /**
    * Infer tab purpose from URL and context
    */
-  private inferPurpose(url: string, title: string): TabContext['purpose'] {
+  private inferPurpose(url: string, title: string, targetId?: string): TabContext['purpose'] {
     if (this.isInternalTab(url)) return 'unknown';
-    if (url.includes('perplexity.ai')) return 'main';
-    // Default to agent-browsing for external sites
+    if ((targetId && targetId === this.automationMainTabId) || this.isPerplexityUrl(url)) return 'main';
+    // Only label tabs opened during this session as agent-browsing
+    if (targetId && this.baselineTabIds.has(targetId)) return 'unknown';
     return 'agent-browsing';
   }
 
@@ -533,13 +913,16 @@ export class CometCDPClient {
 
       if (existing) {
         // Update existing entry
+        const previousDomain = existing.domain;
         existing.url = target.url;
         existing.title = target.title;
         existing.domain = domain;
         existing.lastActivity = currentTime;
-        // Re-infer purpose if URL changed significantly
-        if (existing.domain !== domain) {
-          existing.purpose = this.inferPurpose(target.url, target.title);
+        if (previousDomain !== domain || existing.purpose === 'unknown') {
+          existing.purpose = this.inferPurpose(target.url, target.title, target.id);
+        }
+        if (target.id === this.automationMainTabId) {
+          existing.purpose = 'main';
         }
       } else {
         // New tab - create entry
@@ -547,11 +930,18 @@ export class CometCDPClient {
           id: target.id,
           url: target.url,
           title: target.title,
-          purpose: this.inferPurpose(target.url, target.title),
+          purpose: this.inferPurpose(target.url, target.title, target.id),
           domain,
           lastActivity: currentTime,
         };
         this.tabRegistry.set(target.id, context);
+      }
+
+      if (target.id === this.automationMainTabId) {
+        const controlTab = this.tabRegistry.get(target.id);
+        if (controlTab) {
+          controlTab.purpose = 'main';
+        }
       }
     }
 
@@ -670,10 +1060,7 @@ export class CometCDPClient {
    * Get formatted tab summary for context display (filters out internal Chrome tabs)
    */
   async getTabSummary(): Promise<string> {
-    const allTabs = await this.getTabContexts();
-
-    // Filter out internal Chrome tabs - only show real browsing tabs
-    const tabs = allTabs.filter(t => !this.isInternalTab(t.url));
+    const tabs = await this.getVisibleTabContexts();
 
     if (tabs.length === 0) {
       return "No browsing tabs open";
@@ -685,7 +1072,8 @@ export class CometCDPClient {
       const active = tab.id === this.state.activeTabId ? " [ACTIVE]" : "";
       const task = tab.taskId ? ` (task: ${tab.taskId})` : "";
       const summary = tab.contentSummary ? ` - ${tab.contentSummary}` : "";
-      lines.push(`  • ${tab.purpose.toUpperCase()}: ${tab.domain}${active}${task}${summary}`);
+      const label = tab.purpose === 'unknown' ? 'TAB' : tab.purpose.toUpperCase();
+      lines.push(`  • ${label}: ${tab.domain}${active}${task}${summary}`);
       lines.push(`    URL: ${tab.url.substring(0, 80)}${tab.url.length > 80 ? '...' : ''}`);
     }
 
@@ -740,206 +1128,82 @@ export class CometCDPClient {
    */
   async startComet(port: number = DEFAULT_PORT): Promise<string> {
     this.state.port = port;
+    let config = this.getAutomationConfig();
 
-    // On WSL, use HTTP via PowerShell (WebSocket doesn't work across WSL/Windows boundary)
-    if (IS_WSL) {
-      // Check if Comet is already running with debug port via HTTP
-      try {
-        const response = await windowsFetch(`http://127.0.0.1:${port}/json/version`);
-        if (response.ok) {
-          const version = await response.json() as CDPVersion;
-          return `Comet already running on Windows host, port: ${port} (${version.Browser})`;
-        }
-      } catch {
-        // Comet not accessible, need to launch
+    if (await this.isDebugPortReachable(port)) {
+      const isExpectedAutomation = await this.isExpectedAutomationInstance(port);
+      if (isExpectedAutomation) {
+        console.error(`[comet] Using existing automation instance ${formatAutomationDescriptor(port)}`);
+        return `Comet automation already running on port ${port} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
       }
 
-      // Try to launch Comet via PowerShell on Windows
-      console.error('Comet not accessible, attempting to launch via PowerShell...');
-
-      // Get Windows user's LOCALAPPDATA path
-      let cometPath = '';
-      try {
-        const localAppData = execSync('cmd.exe /c echo %LOCALAPPDATA%', { encoding: 'utf8' }).trim().replace(/\r?\n/g, '');
-        cometPath = `${localAppData}\\Perplexity\\Comet\\Application\\Comet.exe`;
-      } catch {
-        cometPath = 'C:\\Users\\' + (process.env.USER || 'user') + '\\AppData\\Local\\Perplexity\\Comet\\Application\\Comet.exe';
+      const existingAutomationPort = await this.findRunningAutomationPort(port + 1);
+      if (existingAutomationPort !== null) {
+        this.state.port = existingAutomationPort;
+        config = this.getAutomationConfig();
+        console.error(`[comet] Debug port ${port} is attached to a non-automation Comet instance; reusing automation ${formatAutomationDescriptor(existingAutomationPort)}.`);
+        return `Comet automation already running on fallback port ${existingAutomationPort} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
       }
 
-      try {
-        // Launch Comet via PowerShell
-        // Use Set-Location to avoid UNC path issues when running from WSL
-        const psCommand = `Set-Location C:\\; Start-Process -FilePath '${cometPath}' -ArgumentList '--remote-debugging-port=${port}'`;
-        spawn('powershell.exe', ['-NoProfile', '-Command', psCommand], {
-          detached: true,
-          stdio: 'ignore',
-        }).unref();
-
-        // Wait for Comet to start - use HTTP check via PowerShell
-        return new Promise((resolve, reject) => {
-          const maxAttempts = 40;
-          let attempts = 0;
-
-          const checkReady = async () => {
-            attempts++;
-            try {
-              const response = await windowsFetch(`http://127.0.0.1:${port}/json/version`);
-              if (response.ok) {
-                resolve(`Comet started via WSL->PowerShell on port ${port}`);
-                return;
-              }
-            } catch { /* keep trying */ }
-
-            if (attempts < maxAttempts) {
-              setTimeout(checkReady, 500);
-            } else {
-              reject(new Error(
-                `Timeout waiting for Comet. Tried to launch: ${cometPath}\n` +
-                `Try manually: powershell.exe -Command "Start-Process '${cometPath}' -ArgumentList '--remote-debugging-port=${port}'"`
-              ));
-            }
-          };
-
-          setTimeout(checkReady, 2000);
-        });
-      } catch (launchError) {
-        throw new Error(
-          `Cannot connect to or launch Comet browser.\n` +
-          `Tried path: ${cometPath}\n` +
-          `Error: ${launchError instanceof Error ? launchError.message : String(launchError)}`
-        );
-      }
+      const fallbackPort = await this.findAvailableDebugPort(port + 1);
+      this.state.port = fallbackPort;
+      config = this.getAutomationConfig();
+      console.error(`[comet] Debug port ${port} is attached to a non-automation Comet instance; launching automation ${formatAutomationDescriptor(fallbackPort)}.`);
+      await this.launchCometProcess(fallbackPort);
+      await this.waitForDebugPort(fallbackPort, IS_WSL ? 2000 : 1500);
+      return `Comet automation started on fallback port ${fallbackPort} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
     }
 
-    // On Windows (native), try direct WebSocket connection first (bypasses HTTP issues)
-    if (IS_WINDOWS) {
-      try {
-        // Try to connect directly via CDP WebSocket
-        const testClient = await CDP({ port, host: '127.0.0.1' });
-        await testClient.close();
-        return `Comet already running with debug port: ${port}`;
-      } catch {
-        // Comet not running or not accessible, check if process exists
-        const isRunning = await this.isCometProcessRunning();
-        if (!isRunning) {
-          // Start Comet
-          this.cometProcess = spawn(COMET_PATH, [`--remote-debugging-port=${port}`], {
-            detached: true,
-            stdio: "ignore",
-          });
-          this.cometProcess.unref();
-
-          // Wait for Comet to start and try WebSocket connection
-          return new Promise((resolve, reject) => {
-            const maxAttempts = 40;
-            let attempts = 0;
-
-            const checkReady = async () => {
-              attempts++;
-              try {
-                const testClient = await CDP({ port, host: '127.0.0.1' });
-                await testClient.close();
-                resolve(`Comet started with debug port ${port}`);
-                return;
-              } catch { /* keep trying */ }
-
-              if (attempts < maxAttempts) {
-                setTimeout(checkReady, 500);
-              } else {
-                reject(new Error(`Timeout waiting for Comet. Try running: "${COMET_PATH}" --remote-debugging-port=${port}`));
-              }
-            };
-
-            setTimeout(checkReady, 1500);
-          });
-        } else {
-          // Process running but CDP not accessible - need restart with debug port
-          await this.killComet();
-          await new Promise(r => setTimeout(r, 1000));
-
-          this.cometProcess = spawn(COMET_PATH, [`--remote-debugging-port=${port}`], {
-            detached: true,
-            stdio: "ignore",
-          });
-          this.cometProcess.unref();
-
-          return new Promise((resolve, reject) => {
-            const maxAttempts = 40;
-            let attempts = 0;
-
-            const checkReady = async () => {
-              attempts++;
-              try {
-                const testClient = await CDP({ port, host: '127.0.0.1' });
-                await testClient.close();
-                resolve(`Comet restarted with debug port ${port}`);
-                return;
-              } catch { /* keep trying */ }
-
-              if (attempts < maxAttempts) {
-                setTimeout(checkReady, 500);
-              } else {
-                reject(new Error(`Timeout waiting for Comet. Try running: "${COMET_PATH}" --remote-debugging-port=${port}`));
-              }
-            };
-
-            setTimeout(checkReady, 1500);
-          });
-        }
+    const isRunning = await this.isCometProcessRunning();
+    if (isRunning) {
+      // Search for our automation on nearby ports first
+      const existingAutomationPort = await this.findRunningAutomationPort(port);
+      if (existingAutomationPort !== null) {
+        this.state.port = existingAutomationPort;
+        config = this.getAutomationConfig();
+        console.error(`[comet] Found existing automation ${formatAutomationDescriptor(existingAutomationPort)}.`);
+        return `Comet automation already running on port ${existingAutomationPort} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
       }
-    }
 
-    // Non-Windows: use original HTTP-based approach
-    try {
-      const response = await windowsFetch(`http://127.0.0.1:${port}/json/version`);
-
-      if (response.ok) {
-        const version = await response.json() as CDPVersion;
-        return `Comet already running with debug port: ${version.Browser}`;
-      }
-    } catch {
-      const isRunning = await this.isCometProcessRunning();
-      if (isRunning) {
-        await this.killComet();
-      }
-    }
-
-    // Start Comet
-    return new Promise((resolve, reject) => {
-      this.cometProcess = spawn(COMET_PATH, [`--remote-debugging-port=${port}`], {
-        detached: true,
-        stdio: "ignore",
-      });
-      this.cometProcess.unref();
-
-      const maxAttempts = 40;
-      let attempts = 0;
-
-      const checkReady = async () => {
-        attempts++;
-        try {
-          const response = await windowsFetch(`http://127.0.0.1:${port}/json/version`);
-
-          if (response.ok) {
-            const version = await response.json() as CDPVersion;
-            resolve(`Comet started with debug port ${port}: ${version.Browser}`);
-            return;
+      if (getProfileMode() === 'default') {
+        // Default-profile mode: Comet is running but without CDP.
+        // Try common debug ports first (in case it was launched with one we didn't check).
+        for (const probePort of [9222, 9223, 9224, 9225]) {
+          if (probePort === port) continue; // Already checked above
+          if (await this.isDebugPortReachable(probePort)) {
+            this.state.port = probePort;
+            config = this.getAutomationConfig();
+            console.error(`[comet] Default-profile mode: found existing CDP on port ${probePort}. No restart needed.`);
+            return `Comet automation found on port ${probePort} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
           }
-        } catch { /* keep trying */ }
-
-        if (attempts < maxAttempts) {
-          setTimeout(checkReady, 500);
-        } else {
-          const hint = IS_WINDOWS
-            ? `Try running: "${COMET_PATH}" --remote-debugging-port=${port}`
-            : `Try: ${COMET_PATH} --remote-debugging-port=${port}`;
-          reject(new Error(`Timeout waiting for Comet. ${hint}`));
         }
-      };
 
-      setTimeout(checkReady, 1500);
-    });
+        // No CDP port found — must restart with CDP enabled.
+        // --restore-last-session preserves their open tabs; --new-window avoids losing focus.
+        console.error(`[comet] Default-profile mode: Comet running without CDP. Restarting with CDP on port ${port}. Open tabs will be restored via --restore-last-session.`);
+        await this.killComet();
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        await this.launchCometProcess(port, true);
+        await this.waitForDebugPort(port, IS_WSL ? 3000 : 2500);
+
+        config = this.getAutomationConfig();
+        return `Comet automation started on port ${port} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
+      }
+
+      console.error(`[comet] Existing Comet process detected without CDP on port ${port}; leaving it untouched and launching automation ${formatAutomationDescriptor(port)}.`);
+    } else {
+      console.error(`[comet] Launching automation ${formatAutomationDescriptor(port)}.`);
+    }
+
+    await this.launchCometProcess(port);
+    await this.waitForDebugPort(port, IS_WSL ? 2000 : 1500);
+
+    return `Comet automation started on port ${port} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
   }
+
+  /**
+   * Get CDP version info
+   */
 
   /**
    * Get CDP version info
@@ -1146,8 +1410,37 @@ export class CometCDPClient {
    */
   async pressKey(key: string): Promise<void> {
     this.ensureConnected();
+
+    if (key === "Enter") {
+      await this.client!.Input.dispatchKeyEvent({
+        type: "keyDown",
+        key: "Enter",
+        code: "Enter",
+        windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13,
+        unmodifiedText: "\r",
+        text: "\r",
+      });
+      await this.client!.Input.dispatchKeyEvent({
+        type: "keyUp",
+        key: "Enter",
+        code: "Enter",
+        windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13,
+      });
+      return;
+    }
+
     await this.client!.Input.dispatchKeyEvent({ type: "keyDown", key });
     await this.client!.Input.dispatchKeyEvent({ type: "keyUp", key });
+  }
+
+  /**
+   * Insert text via CDP (fires native input events, compatible with React)
+   */
+  async insertText(text: string): Promise<void> {
+    this.ensureConnected();
+    await this.client!.Input.insertText({ text });
   }
 
   /**
