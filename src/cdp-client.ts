@@ -1178,16 +1178,28 @@ export class CometCDPClient {
           }
         }
 
-        // No CDP port found — must restart with CDP enabled.
-        // --restore-last-session preserves their open tabs; --new-window avoids losing focus.
-        console.error(`[comet] Default-profile mode: Comet running without CDP. Restarting with CDP on port ${port}. Open tabs will be restored via --restore-last-session.`);
-        await this.killComet();
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        await this.launchCometProcess(port, true);
-        await this.waitForDebugPort(port, IS_WSL ? 3000 : 2500);
+        // No CDP port found. Respect existing Comet windows by default.
+        const forceRestart = process.env.COMET_FORCE_RESTART === 'true';
+        if (forceRestart) {
+          // Opt-in restart: kill and relaunch with CDP + --restore-last-session to preserve tabs.
+          console.error(`[comet] Default-profile mode: COMET_FORCE_RESTART=true. Restarting Comet with CDP on port ${port}. Open tabs will be restored via --restore-last-session.`);
+          await this.killComet();
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          await this.launchCometProcess(port, true);
+          await this.waitForDebugPort(port, IS_WSL ? 3000 : 2500);
+          config = this.getAutomationConfig();
+          return `Comet automation started on port ${port} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
+        }
 
-        config = this.getAutomationConfig();
-        return `Comet automation started on port ${port} (mode=${config.profileMode}, profile=${config.profileDir}, userDataDir=${config.userDataDir})`;
+        // Non-destructive: tell the user how to start Comet with CDP themselves.
+        const cometPath = COMET_PATH;
+        console.error(`[comet] Default-profile mode: Comet is running without CDP. Cannot attach without restarting.`);
+        console.error(`[comet] To enable CDP, close Comet and relaunch with: "${cometPath}" --remote-debugging-port=${port} --restore-last-session --new-window`);
+        console.error(`[comet] Or set COMET_FORCE_RESTART=true to allow automatic restart.`);
+        return `Comet is running without CDP (remote debugging). To connect:\n` +
+          `1. Close Comet and relaunch with: "${cometPath}" --remote-debugging-port=${port} --restore-last-session --new-window\n` +
+          `2. Or set env var COMET_FORCE_RESTART=true to allow automatic restart (tabs are preserved via --restore-last-session).\n` +
+          `Mode: ${config.profileMode}, Port: ${port}`;
       }
 
       console.error(`[comet] Existing Comet process detected without CDP on port ${port}; leaving it untouched and launching automation ${formatAutomationDescriptor(port)}.`);
