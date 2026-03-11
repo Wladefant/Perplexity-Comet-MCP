@@ -216,11 +216,10 @@ export class CometAI {
 
     // For contenteditable: use CDP insertText for proper React state sync
     if (typed.needsCdpInsert) {
-      await new Promise(resolve => setTimeout(resolve, 200));
       await cometClient.insertText(prompt);
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 200));
     } else {
-      await new Promise(resolve => setTimeout(resolve, 400));
+      await new Promise(resolve => setTimeout(resolve, 200));
     }
 
     const inputState = await this.getInputContentState(inputSelector);
@@ -240,7 +239,7 @@ export class CometAI {
    * Submit the current prompt
    */
   private async submitPrompt(inputSelector: string): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, 200));
 
     const hasContent = await this.verifyInputHasContent(inputSelector);
     if (!hasContent) {
@@ -258,106 +257,51 @@ export class CometAI {
 
     let submitMethod = '';
 
-    if (contentEditableSubmit.result.value === true) {
-      // Dismiss any autocomplete/suggestion overlays that consume Enter
-      await cometClient.pressKey('Escape');
-      await new Promise(resolve => setTimeout(resolve, 300));
-      // Re-focus the input after Escape
+    // Strategy 1: Click the submit button directly (fastest, most reliable)
+    const submitButton = await this.detectSubmitButton(inputSelector);
+    if (submitButton.selector) {
       await cometClient.evaluate(`
         (() => {
-          const el = document.querySelector(${JSON.stringify(inputSelector)});
-          if (el) el.focus();
-        })()
-      `);
-      await new Promise(resolve => setTimeout(resolve, 200));
-
-      await cometClient.pressKey('Enter');
-      await new Promise(resolve => setTimeout(resolve, 900));
-      const inputStateAfterEnter = await this.getInputContentState(inputSelector);
-      if (inputStateAfterEnter.value.length === 0 || await this.isPromptSubmitted(inputSelector)) {
-        submitMethod = 'cdp-enter-key';
-      }
-    } else {
-      await cometClient.evaluate(`
-        (() => {
-          const el = document.querySelector(${JSON.stringify(inputSelector)});
-          if (!el) return false;
-
-          el.focus();
-
-          const form = el.closest('form');
-          if (form && typeof form.requestSubmit === 'function') {
-            form.requestSubmit();
-            return true;
-          }
-
+          const btn = document.querySelector(${JSON.stringify(submitButton.selector)});
+          if (btn && !btn.disabled) { btn.click(); return true; }
           return false;
         })()
       `);
-
-      await new Promise(resolve => setTimeout(resolve, 700));
-      const inputStateAfterPrimaryAttempt = await this.getInputContentState(inputSelector);
-      if (inputStateAfterPrimaryAttempt.value.length === 0 || await this.isPromptSubmitted(inputSelector)) {
-        submitMethod = 'selected-input-submit';
+      await new Promise(resolve => setTimeout(resolve, 400));
+      if (await this.isPromptSubmitted(inputSelector)) {
+        submitMethod = `click-${submitButton.method || 'button'}`;
       }
     }
 
-    if (!submitMethod) {
+    // Strategy 2: Escape autocomplete + Enter key
+    if (!submitMethod && contentEditableSubmit.result.value === true) {
+      await cometClient.pressKey('Escape');
+      await new Promise(resolve => setTimeout(resolve, 150));
       await cometClient.evaluate(`
-        (() => {
-          const el = document.querySelector(${JSON.stringify(inputSelector)});
-          if (el) el.focus();
-          return true;
-        })()
+        (() => { const el = document.querySelector(${JSON.stringify(inputSelector)}); if (el) el.focus(); })()
       `);
+      await new Promise(resolve => setTimeout(resolve, 100));
       await cometClient.pressKey('Enter');
-      await new Promise(resolve => setTimeout(resolve, 900));
+      await new Promise(resolve => setTimeout(resolve, 500));
       if (await this.isPromptSubmitted(inputSelector)) {
         submitMethod = 'cdp-enter-key';
       }
     }
 
-    if (!submitMethod) {
-      const submitButton = await this.detectSubmitButton(inputSelector);
-      if (submitButton.selector) {
-        await cometClient.evaluate(`
-          (() => {
-            const btn = document.querySelector(${JSON.stringify(submitButton.selector)});
-            if (btn && !btn.disabled) {
-              btn.click();
-              return true;
-            }
-            return false;
-          })()
-        `);
-        await new Promise(resolve => setTimeout(resolve, 800));
-        if (await this.isPromptSubmitted(inputSelector)) {
-          submitMethod = `click-${submitButton.method || 'button'}`;
-        }
-      }
-    }
-
+    // Strategy 3: Form submit
     if (!submitMethod) {
       await cometClient.evaluate(`
         (() => {
           const el = document.querySelector(${JSON.stringify(inputSelector)});
           const form = el?.closest('form') || document.querySelector('form');
-          if (!form) {
-            return false;
-          }
-
-          if (typeof form.requestSubmit === 'function') {
-            form.requestSubmit();
-            return true;
-          }
-
-          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-          return true;
+          if (form && typeof form.requestSubmit === 'function') { form.requestSubmit(); return true; }
+          if (form) { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); return true; }
+          return false;
         })()
       `);
-      await new Promise(resolve => setTimeout(resolve, 800));
+      await new Promise(resolve => setTimeout(resolve, 400));
       if (await this.isPromptSubmitted(inputSelector)) {
-        submitMethod = 'form-submit-fallback';
+        submitMethod = 'form-submit';
       }
     }
 
@@ -371,13 +315,13 @@ export class CometAI {
   // Track response stability for completion detection
   private lastResponseText: string = '';
   private stableResponseCount: number = 0;
-  private readonly STABILITY_THRESHOLD: number = 2; // Response must be same for 2 checks
+  private readonly STABILITY_THRESHOLD: number = 2; // Response must be same for 2 consecutive polls
 
   /**
    * Check if response has stabilized (same content for multiple polls)
    */
   isResponseStable(currentResponse: string): boolean {
-    if (currentResponse && currentResponse.length > 50) {
+    if (currentResponse && currentResponse.length > 8) {
       if (currentResponse === this.lastResponseText) {
         this.stableResponseCount++;
       } else {
