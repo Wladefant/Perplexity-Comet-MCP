@@ -1256,6 +1256,10 @@ export class CometCDPClient {
    * Connect to a specific tab
    */
   async connect(targetId?: string): Promise<string> {
+    // Skip reconnect if already connected to the same target (avoids closing open pickers/popovers)
+    if (this.client && targetId && this.state.activeTabId === targetId) {
+      return `Already connected to tab: ${this.state.currentUrl}`;
+    }
     if (this.client) {
       await this.disconnect();
     }
@@ -1446,6 +1450,21 @@ export class CometCDPClient {
   }
 
   /**
+   * Click an element by evaluating a JS expression that returns {x, y} coordinates.
+   * Uses native CDP mouse events, which React's pointer event handlers respond to.
+   * @param jsExpr - JS expression returning {x, y} of the center of the element to click, or null
+   */
+  async clickAtCoords(jsExpr: string): Promise<boolean> {
+    this.ensureConnected();
+    const result = await this.client!.Runtime.evaluate({ expression: jsExpr, returnByValue: true });
+    const coords = result.result.value as { x: number; y: number } | null;
+    if (!coords) return false;
+    await this.client!.Input.dispatchMouseEvent({ type: 'mousePressed', x: coords.x, y: coords.y, button: 'left', clickCount: 1 });
+    await this.client!.Input.dispatchMouseEvent({ type: 'mouseReleased', x: coords.x, y: coords.y, button: 'left', clickCount: 1 });
+    return true;
+  }
+
+  /**
    * Create a new tab
    */
   async newTab(url?: string): Promise<CDPTarget> {
@@ -1559,15 +1578,20 @@ export class CometCDPClient {
           files: [filePath]
         });
 
-        // Trigger change event to notify the page
+        // Trigger React-compatible change event
+        // React 16+ uses a synthetic event system that intercepts native events;
+        // we must simulate a real browser-level change via the native prototype setter.
         await this.client!.Runtime.evaluate({
           expression: `
             (function() {
-              const input = document.querySelector('${selector || 'input[type="file"]'}');
-              if (input) {
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-              }
+              const sel = ${JSON.stringify(selector || 'input[type="file"]')};
+              const input = document.querySelector(sel);
+              if (!input) return;
+              // Dispatch native change event — React's event delegation picks this up
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              // Also try clicking the input to trigger any React onClick → onChange chain
+              input.dispatchEvent(new MouseEvent('click', { bubbles: true }));
             })();
           `
         });

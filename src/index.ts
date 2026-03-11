@@ -121,14 +121,31 @@ const TOOLS: Tool[] = [
   },
   {
     name: "comet_mode",
-    description: "Switch Perplexity search mode. Modes: 'search' (basic), 'research' (deep research), 'labs' (analytics/visualization), 'learn' (educational). Call without mode to see current mode.",
+    description: "Switch Perplexity mode. Current modes: 'search' (standard web search) and 'computer' (agentic browser mode). Call without mode to see current mode.",
     inputSchema: {
       type: "object",
       properties: {
         mode: {
           type: "string",
-          enum: ["search", "research", "labs", "learn"],
+          enum: ["search", "computer"],
           description: "Mode to switch to (optional - omit to see current mode)",
+        },
+      },
+    },
+  },
+  {
+    name: "comet_model",
+    description: "Get or set the AI model used by Perplexity. Available models: 'best' (auto), 'sonar', 'gpt-5.4', 'gemini', 'claude-sonnet', 'claude-opus', 'kimi'. Call without model to see current model.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        model: {
+          type: "string",
+          description: "Model to switch to (optional - omit to see current model). Partial names work: 'claude', 'gpt', 'gemini', 'sonar', 'kimi', 'best'",
+        },
+        thinking: {
+          type: "boolean",
+          description: "Enable or disable the Thinking toggle for Claude models (optional)",
         },
       },
     },
@@ -158,8 +175,8 @@ const TOOLS: Tool[] = [
 ];
 
 const server = new Server(
-  { name: "comet-bridge", version: "2.5.0" },
-  { capabilities: { tools: {} } }
+  { name: "comet-bridge", version: "2.6.2" },
+  { capabilities: { tools: { listChanged: true } } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -538,170 +555,222 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "comet_mode": {
         const mode = args?.mode as string | undefined;
 
+        // Ensure we're on the home page (sidebar modes only show there)
+        await cometClient.withAutomationMainTab(async () => {
+          const state = cometClient.currentState;
+          if (!state.currentUrl?.includes('perplexity.ai')) {
+            await cometClient.navigate("https://www.perplexity.ai/", true);
+            await new Promise(resolve => setTimeout(resolve, 1200));
+          }
+        });
+
         if (!mode) {
+          // Detect current mode from the highlighted sidebar link
           const result = await cometClient.withAutomationMainTab(async () => cometClient.evaluate(`
-            (() => {
-              const modes = ['Search', 'Research', 'Labs', 'Learn'];
-              for (const mode of modes) {
-                const btn = document.querySelector('button[aria-label="' + mode + '"]');
-                if (btn && btn.getAttribute('data-state') === 'checked') {
-                  return mode.toLowerCase();
+            (function() {
+              // Active sidebar link has a highlighted background class
+              const links = [...document.querySelectorAll('a')].filter(a => a.getBoundingClientRect().height > 0);
+              for (const link of links) {
+                const text = link.innerText.trim().toLowerCase();
+                if ((text === 'search' || text === 'computer') && link.closest('nav')) {
+                  const classes = link.className || '';
+                  if (classes.includes('bg-') || link.parentElement?.className?.includes('bg-')) {
+                    return text;
+                  }
                 }
               }
-              const dropdownBtn = document.querySelector('button[class*="gap"]');
-              if (dropdownBtn) {
-                const text = dropdownBtn.innerText.toLowerCase();
-                if (text.includes('search')) return 'search';
-                if (text.includes('research')) return 'research';
-                if (text.includes('labs')) return 'labs';
-                if (text.includes('learn')) return 'learn';
-              }
+              // Fallback: check the Computer button in the input toolbar
+              const computerBtn = document.querySelector('button[aria-label="Computer"]');
+              if (computerBtn && computerBtn.getAttribute('data-state') === 'on') return 'computer';
               return 'search';
             })()
           `));
 
           const currentMode = result.result.value as string;
           const descriptions: Record<string, string> = {
-            search: 'Basic web search',
-            research: 'Deep research with comprehensive analysis',
-            labs: 'Analytics, visualizations, and coding',
-            learn: 'Educational content and explanations'
+            search: 'Standard web search',
+            computer: 'Agentic browser mode (Computer use)',
           };
-
           let output = `Current mode: ${currentMode}\n\nAvailable modes:\n`;
           for (const [m, desc] of Object.entries(descriptions)) {
-            const marker = m === currentMode ? "→" : " ";
-            output += `${marker} ${m}: ${desc}\n`;
+            output += `${m === currentMode ? '→' : ' '} ${m}: ${desc}\n`;
           }
-
           return { content: [{ type: "text", text: output }] };
         }
 
-        const modeMap: Record<string, string> = {
-          search: "Search",
-          research: "Research",
-          labs: "Labs",
-          learn: "Learn",
-        };
-        const ariaLabel = modeMap[mode];
-        if (!ariaLabel) {
+        if (mode !== 'search' && mode !== 'computer') {
           return {
-            content: [{ type: "text", text: `Invalid mode: ${mode}. Use: search, research, labs, learn` }],
+            content: [{ type: "text", text: `Invalid mode: ${mode}. Current Perplexity modes are: search, computer` }],
             isError: true,
           };
         }
 
-        // Navigate to home page for mode switching (modes are on the main search page)
-        await cometClient.withAutomationMainTab(async () => {
-          const state = cometClient.currentState;
-          if (!state.currentUrl || !state.currentUrl.match(/perplexity\.ai\/?$/)) {
-            await cometClient.navigate("https://www.perplexity.ai/", true);
-            await new Promise(resolve => setTimeout(resolve, 1500));
-          }
-        });
-
-        const result = await cometClient.withAutomationMainTab(async () => {
-          return cometClient.evaluate(`
-            (() => {
-              // Try direct aria-label buttons first (old UI)
-              const directBtn = document.querySelector('button[aria-label="${ariaLabel}"]');
-              if (directBtn) {
-                directBtn.click();
-                return { success: true, method: 'direct-button' };
+        // Click the sidebar link for the desired mode
+        const switchResult = await cometClient.withAutomationMainTab(async () => cometClient.evaluate(`
+          (function() {
+            const desired = '${mode}';
+            // Find sidebar nav links (Search / Computer)
+            const links = [...document.querySelectorAll('nav a')].filter(a => a.getBoundingClientRect().height > 0);
+            for (const link of links) {
+              if (link.innerText.trim().toLowerCase() === desired) {
+                link.click();
+                return { success: true };
               }
-
-              // Try finding any button that could open a mode/model menu
-              const menuButton = [...document.querySelectorAll('button')].find(btn => {
-                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                const text = (btn.innerText || '').trim().toLowerCase();
-                return aria === 'model' || text === 'model' ||
-                       aria.includes('search mode') || aria.includes('focus') ||
-                       text === 'search' || text === 'research' || text === 'labs' || text === 'learn';
-              });
-
-              if (menuButton) {
-                // If this button IS the desired mode, just click it
-                const btnText = (menuButton.innerText || '').trim().toLowerCase();
-                if (btnText === '${mode}'.toLowerCase()) {
-                  menuButton.click();
-                  return { success: true, method: 'direct-mode-button' };
-                }
-                menuButton.click();
-                return { success: true, method: 'model-menu', needsSelect: true };
-              }
-
-              return { success: false, error: "Mode selector not found on page. Navigate to perplexity.ai first." };
-            })()
-          `);
-        });
-
-        const clickResult = result.result.value as { success: boolean; method?: string; needsSelect?: boolean; error?: string };
-
-        if (clickResult.success && clickResult.needsSelect) {
-          // Wait for dropdown/popover to render
-          await new Promise(resolve => setTimeout(resolve, 600));
-
-          // Try selecting the mode from the dropdown with retries
-          for (let attempt = 0; attempt < 3; attempt++) {
-            const selectResult = await cometClient.withAutomationMainTab(async () => cometClient.evaluate(`
-              (() => {
-                const desired = '${mode}'.toLowerCase();
-                // Search for clickable elements matching the desired mode
-                // Use leaf-node links/buttons first (most specific), then broaden
-                const selectors = ['a', 'button', '[role="menuitem"]', '[role="option"]', 'div[role="button"]', 'label'];
-                for (const sel of selectors) {
-                  const items = [...document.querySelectorAll(sel)];
-                  for (const item of items) {
-                    const text = (item.innerText || '').trim().toLowerCase();
-                    const aria = (item.getAttribute?.('aria-label') || '').trim().toLowerCase();
-                    const rect = item.getBoundingClientRect();
-                    const isVisible = rect.height > 0 && rect.width > 0;
-                    // Match: exact text match or text starts with desired mode
-                    if (isVisible && text.length < 40 && (text === desired || aria === desired)) {
-                      item.click();
-                      return { success: true, matched: text || aria };
-                    }
-                  }
-                }
-                // Fallback: partial match (text starts with desired)
-                for (const sel of selectors) {
-                  const items = [...document.querySelectorAll(sel)];
-                  for (const item of items) {
-                    const text = (item.innerText || '').trim().toLowerCase();
-                    const aria = (item.getAttribute?.('aria-label') || '').trim().toLowerCase();
-                    const rect = item.getBoundingClientRect();
-                    const isVisible = rect.height > 0 && rect.width > 0;
-                    if (isVisible && text.length < 40 && (text.startsWith(desired) || aria.startsWith(desired))) {
-                      item.click();
-                      return { success: true, matched: text || aria };
-                    }
-                  }
-                }
-                // Debug info
-                const visibleLinks = [...document.querySelectorAll('a, button')].filter(e => e.getBoundingClientRect().height > 0).map(e => e.innerText.trim().substring(0, 30)).filter(t => t.length > 0 && t.length < 30);
-                return { success: false, error: "Mode option not found in dropdown", visibleOptions: visibleLinks.slice(0, 15).join(', ') };
-              })()
-            `));
-            const selectRes = selectResult.result.value as { success: boolean; error?: string; matched?: string; visibleOptions?: string };
-            if (selectRes.success) {
-              return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
             }
-            if (attempt < 2) {
-              await new Promise(resolve => setTimeout(resolve, 400));
-            } else {
-              return { content: [{ type: "text", text: `Failed: ${selectRes.error}${selectRes.visibleOptions ? ` (visible: ${selectRes.visibleOptions})` : ''}` }], isError: true };
+            // Fallback: check input toolbar Computer toggle button
+            if (desired === 'computer') {
+              const btn = document.querySelector('button[aria-label="Computer"]');
+              if (btn) { btn.click(); return { success: true }; }
             }
-          }
-        }
+            return { success: false, available: [...document.querySelectorAll('nav a')].map(a => a.innerText.trim()).filter(t => t).join(', ') };
+          })()
+        `));
 
-        if (clickResult.success) {
+        const switchRes = switchResult.result.value as { success: boolean; available?: string };
+        if (switchRes.success) {
           return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
         }
-
         return {
-          content: [{ type: "text", text: `Failed to switch mode: ${clickResult.error}` }],
+          content: [{ type: "text", text: `Failed to switch mode. Available sidebar links: ${switchRes.available || 'none found'}` }],
           isError: true,
         };
+      }
+
+      case "comet_model": {
+        const modelArg = (args?.model as string | undefined)?.toLowerCase().trim();
+        const thinkingArg = args?.thinking as boolean | undefined;
+
+        // Ensure we're on perplexity home
+        await cometClient.withAutomationMainTab(async () => {
+          const state = cometClient.currentState;
+          if (!state.currentUrl?.includes('perplexity.ai')) {
+            await cometClient.navigate("https://www.perplexity.ai/", true);
+            await new Promise(resolve => setTimeout(resolve, 1200));
+          }
+        });
+
+        // Model button is identified by its aria-label containing a known model keyword
+        const MODEL_KEYWORDS = ['claude', 'gpt', 'sonar', 'gemini', 'kimi', 'best'];
+        const currentModelResult = await cometClient.withAutomationMainTab(async () => cometClient.evaluate(`
+          (function() {
+            const keywords = ${JSON.stringify(MODEL_KEYWORDS)};
+            const btn = [...document.querySelectorAll('button')].find(b => {
+              if (!b.getBoundingClientRect().height) return false;
+              const label = (b.getAttribute('aria-label') || '').toLowerCase();
+              return keywords.some(k => label.includes(k)) || label === 'model';
+            });
+            return btn ? { label: btn.getAttribute('aria-label'), text: btn.innerText?.trim() } : null;
+          })()
+        `));
+        const currentModel = currentModelResult.result.value as { label: string; text: string } | null;
+
+        if (!modelArg && thinkingArg === undefined) {
+          const name = currentModel?.label || currentModel?.text || 'unknown';
+          return { content: [{ type: "text", text: `Current model: ${name}\n\nAvailable models: best, sonar, gpt-5.4, gemini, claude-sonnet, claude-opus, kimi` }] };
+        }
+
+        // All picker interaction happens in a single withAutomationMainTab call to avoid
+        // CDP reconnects closing the popover between operations.
+        const aliases: Record<string, string> = {
+          'best': 'best', 'auto': 'best',
+          'sonar': 'sonar',
+          'gpt': 'gpt', 'gpt-5.4': 'gpt-5.4', 'gpt5': 'gpt-5.4',
+          'gemini': 'gemini', 'google': 'gemini',
+          'claude': 'claude sonnet', 'claude-sonnet': 'claude sonnet',
+          'claude-opus': 'claude opus', 'opus': 'claude opus',
+          'kimi': 'kimi',
+        };
+        const targetText = modelArg ? (aliases[modelArg] || modelArg) : '';
+
+        const pickerResult = await cometClient.withAutomationMainTab(async () => {
+          // Step 1: click the model button
+          const opened = await cometClient.clickAtCoords(`
+            (function() {
+              const keywords = ${JSON.stringify(MODEL_KEYWORDS)};
+              const btn = [...document.querySelectorAll('button')].find(b => {
+                if (!b.getBoundingClientRect().height) return false;
+                const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                return keywords.some(k => label.includes(k)) || label === 'model';
+              });
+              if (!btn) return null;
+              const r = btn.getBoundingClientRect();
+              return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            })()
+          `);
+          if (!opened) return { error: 'no-button' };
+
+          // Step 2: wait for picker to open
+          await new Promise(resolve => setTimeout(resolve, 1200));
+
+          // Step 3: handle thinking toggle if requested (same open picker)
+          if (thinkingArg !== undefined) {
+            const toggleR = await cometClient.evaluate(`
+              (function() {
+                const toggle = [...document.querySelectorAll('[role="menuitemcheckbox"]')]
+                  .find(e => e.getBoundingClientRect().height > 0 && (e.innerText || '').toLowerCase().includes('thinking'));
+                if (!toggle) return null;
+                const isOn = toggle.getAttribute('aria-checked') === 'true' || toggle.getAttribute('data-state') === 'checked';
+                const wantOn = ${thinkingArg};
+                if (isOn !== wantOn) toggle.click();
+                return { toggled: isOn !== wantOn, nowOn: wantOn };
+              })()
+            `);
+            const toggleRes = toggleR.result.value;
+            if (!modelArg) {
+              await new Promise(resolve => setTimeout(resolve, 200));
+              await cometClient.evaluate(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+              return { thinking: thinkingArg, thinkingResult: toggleRes };
+            }
+          }
+
+          if (!modelArg) {
+            await cometClient.evaluate(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+            return { thinking: thinkingArg };
+          }
+
+          // Step 4: find target model in picker
+          const target = targetText.toLowerCase();
+          const queryR = await cometClient.evaluate(`
+            (function() {
+              const target = '${target}';
+              const items = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="menuitemcheckbox"]')]
+                .filter(e => e.getBoundingClientRect().height > 0);
+              if (items.length === 0) return { pickerClosed: true };
+              const matches = items
+                .map(e => ({ text: (e.innerText || '').trim().toLowerCase(), rect: e.getBoundingClientRect() }))
+                .filter(({ text: t }) => t.startsWith(target))
+                .sort((a, b) => a.text.length - b.text.length);
+              if (matches.length > 0) {
+                const r = matches[0].rect;
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2, matched: matches[0].text.split('\\n')[0].substring(0, 40) };
+              }
+              const visible = items.map(e => (e.innerText || '').trim().split('\\n')[0].substring(0, 20));
+              return { notFound: true, visible: [...new Set(visible)].join(', ') };
+            })()
+          `);
+          const sel = queryR.result.value as { x?: number; y?: number; matched?: string; notFound?: boolean; visible?: string; pickerClosed?: boolean } | undefined;
+          if (!sel || sel.pickerClosed || sel.notFound) return sel ?? { error: 'query-failed' };
+
+          // Step 5: click the model item
+          await cometClient.clickAtCoords(`({ x: ${sel.x}, y: ${sel.y} })`);
+          return { switched: sel.matched };
+        });
+
+        if (!pickerResult) return { content: [{ type: "text", text: 'Picker interaction failed' }], isError: true };
+        if ('error' in pickerResult) {
+          const msg = pickerResult.error === 'no-button' ? 'Could not find model button' : 'Picker query failed';
+          return { content: [{ type: "text", text: msg }], isError: true };
+        }
+        if ('thinking' in pickerResult) {
+          return { content: [{ type: "text", text: `Thinking ${pickerResult.thinking ? 'enabled' : 'disabled'}` }] };
+        }
+        if ('pickerClosed' in pickerResult) {
+          return { content: [{ type: "text", text: 'Could not open model picker' }], isError: true };
+        }
+        if ('notFound' in pickerResult) {
+          return { content: [{ type: "text", text: `Model "${modelArg}" not found. Options: ${pickerResult.visible}` }], isError: true };
+        }
+        return { content: [{ type: "text", text: `Switched to model: ${(pickerResult as { switched: string }).switched}` }] };
       }
 
       case "comet_upload": {

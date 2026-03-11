@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "perplexity-comet": {
+      "type": "stdio",
+      "command": "mcpmon",
+      "args": ["--watch", "dist/", "--ext", "js", "--", "node", "dist/index.js"]
+    }
+  }
+}
