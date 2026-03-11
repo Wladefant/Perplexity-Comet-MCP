@@ -284,8 +284,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let sawNewResponse = false;
         let lastActivityTime = Date.now();
         let previousResponse = '';
-        const POLL_INTERVAL = 1500;
-        const IDLE_TIMEOUT = 6000;
+        const POLL_INTERVAL = 500;
+        const IDLE_TIMEOUT = 2000;
         let consecutiveErrors = 0;
         const MAX_CONSECUTIVE_ERRORS = 5;
 
@@ -682,14 +682,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return { success: false, error: "Mode option not found in dropdown", visibleOptions: visibleLinks.slice(0, 15).join(', ') };
               })()
             `));
-            const selectRes = selectResult.result.value as { success: boolean; error?: string; matched?: string; candidateCount?: number };
+            const selectRes = selectResult.result.value as { success: boolean; error?: string; matched?: string; visibleOptions?: string };
             if (selectRes.success) {
               return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
             }
             if (attempt < 2) {
               await new Promise(resolve => setTimeout(resolve, 400));
             } else {
-              return { content: [{ type: "text", text: `Failed: ${selectRes.error} (${selectRes.candidateCount} visible items checked)` }], isError: true };
+              return { content: [{ type: "text", text: `Failed: ${selectRes.error}${selectRes.visibleOptions ? ` (visible: ${selectRes.visibleOptions})` : ''}` }], isError: true };
             }
           }
         }

@@ -585,7 +585,8 @@ export class CometCDPClient {
       });
     }
 
-    return false;
+    // Non-Windows: accept any reachable debug port as the expected instance
+    return true;
   }
 
   private async getBrowserCommandLine(port: number): Promise<string[] | null> {
@@ -775,11 +776,6 @@ export class CometCDPClient {
   setAutomationMainTabId(tabId: string | undefined): void {
     this.automationMainTabId = tabId;
   }
-
-  /**
-   * Ensure we're connected to the main Perplexity tab
-   * Used during agentic browsing when Comet may open new tabs
-   */
 
   /**
    * Ensure we're connected to the main Perplexity tab
