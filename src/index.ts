@@ -14,7 +14,6 @@ import {
 import { cometClient } from "./cdp-client.js";
 import { cometAI } from "./comet-ai.js";
 
-// Session state for tracking task progress and preventing stale responses
 interface SessionState {
   currentTaskId: string | null;
   taskStartTime: number | null;
@@ -35,12 +34,10 @@ const sessionState: SessionState = {
   isActive: false,
 };
 
-// Helper to generate task ID
 function generateTaskId(): string {
   return `task_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
 }
 
-// Helper to reset session for new task
 function startNewTask(prompt: string): string {
   const taskId = generateTaskId();
   sessionState.currentTaskId = taskId;
@@ -54,17 +51,14 @@ function startNewTask(prompt: string): string {
   return taskId;
 }
 
-// Helper to complete task
 function completeTask(response: string): void {
   sessionState.lastResponse = response;
   sessionState.lastResponseTime = Date.now();
   sessionState.isActive = false;
 }
 
-// Helper to check if session is stale
 function isSessionStale(): boolean {
   if (!sessionState.taskStartTime) return true;
-  // Consider session stale if no activity for 5 minutes
   return Date.now() - sessionState.taskStartTime > 5 * 60 * 1000;
 }
 
@@ -176,151 +170,101 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "comet_connect": {
-        // Auto-start Comet with debug port (will restart if running without it)
-        const startResult = await cometClient.startComet(9223);
+        const requestedAutomationConfig = cometClient.getAutomationConfig();
+        const startResult = await cometClient.startComet(requestedAutomationConfig.port);
+        const activeAutomationConfig = cometClient.getAutomationConfig();
+        const mainTab = await cometClient.connectToAutomationMainTab();
+        cometClient.setAutomationMainTabId(mainTab.id);
 
-        // Get all tabs - DON'T clean up tabs, as closing them can crash Comet
-        const targets = await cometClient.listTargets();
-        const freshTargets = targets; // Use the same list, no cleanup
+        console.error(`[comet] Connected automation session mode=${activeAutomationConfig.profileMode} port=${activeAutomationConfig.port} profile=${activeAutomationConfig.profileDir} userDataDir=${activeAutomationConfig.userDataDir} controlTab=${mainTab.id}`);
 
-        // Prefer connecting to existing Perplexity tab, or any page tab
-        const perplexityTab = freshTargets.find(t => t.type === 'page' && t.url.includes('perplexity.ai'));
-        const anyPage = perplexityTab || freshTargets.find(t => t.type === 'page');
-
-        if (anyPage) {
-          await cometClient.connect(anyPage.id);
-
-          // Only navigate to Perplexity if not already there
-          if (!anyPage.url.includes('perplexity.ai')) {
-            await cometClient.navigate("https://www.perplexity.ai/", true);
-            await new Promise(resolve => setTimeout(resolve, 1500));
-          }
-
-          return { content: [{ type: "text", text: `${startResult}\nConnected to Perplexity` }] };
-        }
-
-        // No tabs at all - create a new one
-        const newTab = await cometClient.newTab("https://www.perplexity.ai/");
-        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for page load
-        await cometClient.connect(newTab.id);
-        return { content: [{ type: "text", text: `${startResult}\nCreated new tab and navigated to Perplexity` }] };
+        return {
+          content: [{
+            type: "text",
+            text: `${startResult}\nConnected automation session mode=${activeAutomationConfig.profileMode} profile=${activeAutomationConfig.profileDir} userDataDir=${activeAutomationConfig.userDataDir} with Perplexity control tab (${mainTab.id})`
+          }]
+        };
       }
 
       case "comet_ask": {
         let prompt = args?.prompt as string;
         const context = args?.context as string | undefined;
-        const maxTimeout = (args?.timeout as number) || 120000; // Max 2 minutes safety net
+        const maxTimeout = (args?.timeout as number) || 120000;
         const newChat = (args?.newChat as boolean) || false;
 
-        // Validate prompt
         if (!prompt || prompt.trim().length === 0) {
           return { content: [{ type: "text", text: "Error: prompt cannot be empty" }] };
         }
 
-        // If context is provided, prepend it to the prompt
         if (context && context.trim().length > 0) {
-          // Format context as a clear prefix
           const contextPrefix = `Context for this task:\n\`\`\`\n${context.trim()}\n\`\`\`\n\nBased on the above context, `;
           prompt = contextPrefix + prompt;
         }
 
-        // Start new task session - resets state and prevents stale poll responses
-        const taskId = startNewTask(prompt);
+        startNewTask(prompt);
 
-        // CRITICAL: Pre-operation connection check for one-shot reliability
         try {
           await cometClient.preOperationCheck();
-        } catch (preCheckError) {
-          // If pre-check fails, try to recover
+          await cometClient.connectToAutomationMainTab();
+        } catch {
           try {
-            await cometClient.startComet(9223);
-            const targets = await cometClient.listTargets();
-            const page = targets.find(t => t.type === 'page');
-            if (page) await cometClient.connect(page.id);
+            await cometClient.startComet(cometClient.getAutomationConfig().port);
+            await cometClient.connectToAutomationMainTab();
           } catch {
             return { content: [{ type: "text", text: "Error: Failed to establish connection to Comet browser" }] };
           }
         }
 
-        // Normalize prompt - convert markdown/bullets to natural text
         prompt = prompt
-          .replace(/^[-*•]\s*/gm, '')  // Remove bullet points
-          .replace(/\n+/g, ' ')         // Collapse newlines to spaces
-          .replace(/\s+/g, ' ')         // Collapse multiple spaces
+          .replace(/^[-*•]\s*/gm, '')
+          .replace(/\n+/g, ' ')
+          .replace(/\s+/g, ' ')
           .trim();
 
-        // Transform prompt to trigger agentic browsing when needed
-        // Detect if prompt requires browser actions (URLs, action verbs, website references)
+        // Only add agentic browsing prefix when the prompt contains an explicit URL.
+        // Common words like "check", "read", "open" in regular prompts should NOT
+        // trigger the browsing transform — Perplexity handles agentic browsing on its own.
         const hasUrl = /https?:\/\/[^\s]+/.test(prompt);
-        const hasWebsiteRef = /\b(go to|visit|navigate|open|browse|check|look at|read from|click|fill|submit|login|sign in|download from)\b/i.test(prompt);
-        const hasSiteNames = /\b(\.com|\.org|\.io|\.net|\.ai|website|webpage|page|site)\b/i.test(prompt);
-        const needsAgenticBrowsing = hasUrl || hasWebsiteRef || hasSiteNames;
-
-        // If prompt needs browser action but doesn't have agentic language, add it
-        if (needsAgenticBrowsing) {
+        if (hasUrl) {
           const alreadyAgentic = /^(use your browser|using your browser|open a browser|navigate to|browse to)/i.test(prompt);
           if (!alreadyAgentic) {
-            // Transform to agentic prompt
-            if (hasUrl) {
-              // Extract URL and restructure prompt
-              const urlMatch = prompt.match(/https?:\/\/[^\s]+/);
-              if (urlMatch) {
-                const url = urlMatch[0];
-                const restOfPrompt = prompt.replace(url, '').trim();
-                prompt = `Use your browser to navigate to ${url} and ${restOfPrompt || 'tell me what you find there'}`;
-              }
-            } else {
-              // Add agentic prefix for site references
-              prompt = `Use your browser to ${prompt.toLowerCase().startsWith('go') ? '' : 'go and '}${prompt}`;
+            const urlMatch = prompt.match(/https?:\/\/[^\s]+/);
+            if (urlMatch) {
+              const url = urlMatch[0];
+              const restOfPrompt = prompt.replace(url, '').trim();
+              prompt = `Use your browser to navigate to ${url} and ${restOfPrompt || 'tell me what you find there'}`;
             }
           }
         }
 
-        // For newChat: navigate to fresh Perplexity home (don't aggressively close tabs)
-        if (newChat) {
-          // Ensure we're connected
-          await cometClient.ensureConnection();
+        await cometClient.connectToAutomationMainTab();
 
-          // Just navigate to Perplexity home for a fresh start
-          try {
-            await cometClient.navigate("https://www.perplexity.ai/", true);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-          } catch (navError) {
-            // If navigation fails, try to reconnect and retry
-            const targets = await cometClient.listTargets();
-            const mainTab = targets.find(t => t.type === 'page' && t.url.includes('perplexity'));
-            if (mainTab) {
-              await cometClient.connect(mainTab.id);
-            } else {
-              const anyPage = targets.find(t => t.type === 'page');
-              if (anyPage) {
-                await cometClient.connect(anyPage.id);
-                await cometClient.navigate("https://www.perplexity.ai/", true);
-              }
-            }
-            await new Promise(resolve => setTimeout(resolve, 1500));
-          }
+        if (newChat) {
+          await cometClient.ensureConnection();
+          const mainTab = await cometClient.connectToAutomationMainTab();
+          cometClient.setAutomationMainTabId(mainTab.id);
+          await cometClient.navigate("https://www.perplexity.ai/", true);
+          await new Promise(resolve => setTimeout(resolve, 2200));
         } else {
-          // Not newChat - just ensure we're on Perplexity
-          const tabs = await cometClient.listTabsCategorized();
-          if (tabs.main) {
-            await cometClient.connect(tabs.main.id);
-          }
+          const mainTab = await cometClient.connectToAutomationMainTab();
+          cometClient.setAutomationMainTabId(mainTab.id);
 
           const urlResult = await cometClient.evaluate('window.location.href');
           const currentUrl = urlResult.result.value as string;
-          const isOnPerplexity = currentUrl?.includes('perplexity.ai');
-
-          if (!isOnPerplexity) {
+          if (!currentUrl?.includes('perplexity.ai')) {
             await cometClient.navigate("https://www.perplexity.ai/", true);
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
         }
 
-        // Reset stability tracking for new prompt
+        const askAutomationConfig = cometClient.getAutomationConfig();
+        console.error(`[comet] Ask using automation controlTab=${cometClient.getAutomationMainTabId() || 'unknown'} port=${askAutomationConfig.port} profile=${askAutomationConfig.profileDir}`);
+
         cometAI.resetStabilityTracking();
 
-        // Capture old response state BEFORE sending prompt (for follow-up detection)
+        const oldUrlResult = await cometClient.evaluate('window.location.href');
+        const oldUrl = (oldUrlResult.result.value as string) || '';
+
         const oldStateResult = await cometClient.evaluate(`
           (() => {
             const proseEls = document.querySelectorAll('[class*="prose"]');
@@ -333,17 +277,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
         const oldState = oldStateResult.result.value as { count: number; lastText: string };
 
-        // Send the prompt
         await cometAI.sendPrompt(prompt);
 
-        // Smart polling - detect completion based on activity, not fixed timeout
         const startTime = Date.now();
         const stepsCollected: string[] = [];
         let sawNewResponse = false;
         let lastActivityTime = Date.now();
         let previousResponse = '';
-        const POLL_INTERVAL = 1500; // Poll every 1.5 seconds for balance
-        const IDLE_TIMEOUT = 6000; // If no activity for 6s and we have a response, consider done
+        const POLL_INTERVAL = 1500;
+        const IDLE_TIMEOUT = 6000;
         let consecutiveErrors = 0;
         const MAX_CONSECUTIVE_ERRORS = 5;
 
@@ -351,122 +293,109 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
 
           try {
-            // CRITICAL: Ensure we're on Perplexity tab during agentic browsing
-            // Comet may have opened new tabs which can break our connection
-            const isOnPerplexity = await cometClient.isOnPerplexityTab();
-            if (!isOnPerplexity) {
-              const switched = await cometClient.ensureOnPerplexityTab();
-              if (!switched) {
-                consecutiveErrors++;
-                continue; // Try again next poll
-              }
-            }
+            const status = await cometClient.withAutomationMainTab(async () => {
+              const currentStateResult = await cometClient.withAutoReconnect(async () => {
+                return await cometClient.evaluate(`
+                  (() => {
+                    const proseEls = document.querySelectorAll('[class*="prose"]');
+                    const lastProse = proseEls[proseEls.length - 1];
+                    return {
+                      count: proseEls.length,
+                      lastText: lastProse ? lastProse.innerText.substring(0, 100) : ''
+                    };
+                  })()
+                `);
+              });
+              const currentState = currentStateResult.result.value as { count: number; lastText: string };
 
-            // Check if we have a NEW response (more prose elements or different text)
-            const currentStateResult = await cometClient.withAutoReconnect(async () => {
-              return await cometClient.evaluate(`
-                (() => {
-                  const proseEls = document.querySelectorAll('[class*="prose"]');
-                  const lastProse = proseEls[proseEls.length - 1];
-                  return {
-                    count: proseEls.length,
-                    lastText: lastProse ? lastProse.innerText.substring(0, 100) : ''
-                  };
-                })()
-              `);
+              if (!sawNewResponse) {
+                // Check URL change (most reliable signal — home → search results)
+                try {
+                  const curUrlResult = await cometClient.evaluate('window.location.href');
+                  const curUrl = (curUrlResult.result.value as string) || '';
+                  if (curUrl !== oldUrl && curUrl.includes('/search/')) {
+                    sawNewResponse = true;
+                  }
+                } catch { /* continue with prose check */ }
+
+                // Also check prose element changes
+                if (currentState.count > oldState.count ||
+                    (currentState.lastText && currentState.lastText !== oldState.lastText)) {
+                  sawNewResponse = true;
+                }
+              }
+
+              return await cometAI.getAgentStatus();
             });
-            const currentState = currentStateResult.result.value as { count: number; lastText: string };
 
-            // Detect new response
-            if (!sawNewResponse) {
-              if (currentState.count > oldState.count ||
-                  (currentState.lastText && currentState.lastText !== oldState.lastText)) {
-                sawNewResponse = true;
-              }
-            }
+            consecutiveErrors = 0;
 
-            const status = await cometAI.getAgentStatus();
-            consecutiveErrors = 0; // Reset error count on success
-
-            // Track activity - if response changed, update activity time
             if (status.response !== previousResponse) {
               lastActivityTime = Date.now();
               previousResponse = status.response;
             }
 
-            // Collect steps
             for (const step of status.steps) {
               if (!stepsCollected.includes(step)) {
                 stepsCollected.push(step);
-                lastActivityTime = Date.now(); // New step = activity
+                lastActivityTime = Date.now();
               }
             }
 
-            // Track steps in session state
             sessionState.steps = stepsCollected;
 
-            // COMPLETION CONDITIONS (return immediately when any are met):
-
-            // 1. Explicit completion detected by status checker
             if (status.status === 'completed' && sawNewResponse && status.response) {
               completeTask(status.response);
               return { content: [{ type: "text", text: status.response }] };
             }
 
-            // 2. Response is stable (same content for 2+ polls) and no stop button
             if (status.isStable && sawNewResponse && status.response && !status.hasStopButton) {
               completeTask(status.response);
               return { content: [{ type: "text", text: status.response }] };
             }
 
-            // 3. Idle timeout - no activity for 6s but we have a substantial response
             const idleTime = Date.now() - lastActivityTime;
-            if (idleTime > IDLE_TIMEOUT && sawNewResponse && status.response &&
-                status.response.length > 100 && !status.hasStopButton) {
+            if (idleTime > IDLE_TIMEOUT && sawNewResponse && status.response && status.response.length > 10 && !status.hasStopButton) {
               completeTask(status.response);
               return { content: [{ type: "text", text: status.response }] };
             }
-          } catch (pollError) {
+          } catch {
             consecutiveErrors++;
 
-            // Try to recover by switching to Perplexity tab
             try {
-              const recovered = await cometClient.ensureOnPerplexityTab();
-              if (recovered) {
-                consecutiveErrors = Math.max(0, consecutiveErrors - 1);
-                continue;
-              }
+              await cometClient.connectToAutomationMainTab();
+              consecutiveErrors = Math.max(0, consecutiveErrors - 1);
+              continue;
             } catch {
-              // Continue to fallback
+              // Continue to fallback recovery.
             }
 
             if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-              // Too many errors, try harder to recover
               try {
                 await cometClient.ensureConnection();
-                await cometClient.ensureOnPerplexityTab();
+                await cometClient.connectToAutomationMainTab();
                 consecutiveErrors = 0;
               } catch {
-                // If still failing, exit loop and return partial result
                 break;
               }
             }
-            // Continue polling despite temporary errors
-            continue;
           }
         }
 
-        // Max timeout reached - return whatever we have
-        const finalStatus = await cometAI.getAgentStatus();
-        if (finalStatus.response && finalStatus.response.length > 50) {
+        let finalStatus;
+        try {
+          finalStatus = await cometClient.withAutomationMainTab(async () => cometAI.getAgentStatus());
+        } catch {
+          // Status check failed — fall through to timeout message
+        }
+        if (finalStatus?.response && finalStatus.response.length > 0) {
           completeTask(finalStatus.response);
           return { content: [{ type: "text", text: finalStatus.response }] };
         }
 
-        // No response - return progress info (task still active)
         let inProgressMsg = `Task may still be in progress (max timeout reached).\n`;
-        inProgressMsg += `Status: ${finalStatus.status.toUpperCase()}\n`;
-        if (finalStatus.currentStep) {
+        inProgressMsg += `Status: ${finalStatus?.status?.toUpperCase() || 'UNKNOWN'}\n`;
+        if (finalStatus?.currentStep) {
           inProgressMsg += `Current: ${finalStatus.currentStep}\n`;
         }
         if (stepsCollected.length > 0) {
@@ -474,23 +403,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         inProgressMsg += `\nUse comet_poll to check progress or comet_stop to cancel.`;
 
-        // Keep task active since it may still be running
         sessionState.steps = stepsCollected;
         return { content: [{ type: "text", text: inProgressMsg }] };
       }
 
       case "comet_poll": {
-        // Check if there's an active task session
         if (!sessionState.isActive && !sessionState.currentTaskId) {
           return { content: [{ type: "text", text: "Status: IDLE\nNo active task. Use comet_ask to start a new task." }] };
         }
 
-        // Check for stale session (no activity for 5+ minutes)
         if (isSessionStale() && !sessionState.isActive) {
           return { content: [{ type: "text", text: "Status: IDLE\nPrevious task session expired. Use comet_ask to start a new task." }] };
         }
 
-        // If task was already completed, return the cached response
         if (!sessionState.isActive && sessionState.lastResponse) {
           const timeSinceComplete = sessionState.lastResponseTime
             ? Math.round((Date.now() - sessionState.lastResponseTime) / 1000)
@@ -498,31 +423,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: `Status: COMPLETED (${timeSinceComplete}s ago)\n\n${sessionState.lastResponse}` }] };
         }
 
-        // Active task - get fresh status from Perplexity
-        await cometClient.ensureOnPerplexityTab();
-        const status = await cometAI.getAgentStatus();
+        const status = await cometClient.withAutomationMainTab(async () => cometAI.getAgentStatus());
 
-        // If completed, update session state and return response
         if (status.status === 'completed' && status.response) {
           completeTask(status.response);
           return { content: [{ type: "text", text: status.response }] };
         }
 
-        // Still working - return progress info
         let output = `Status: ${status.status.toUpperCase()}\n`;
         if (sessionState.currentTaskId) {
           output += `Task: ${sessionState.currentTaskId}\n`;
         }
-
         if (status.agentBrowsingUrl) {
           output += `Browsing: ${status.agentBrowsingUrl}\n`;
         }
-
         if (status.currentStep) {
           output += `Current: ${status.currentStep}\n`;
         }
 
-        // Combine session steps with current status steps
         const allSteps = [...new Set([...sessionState.steps, ...status.steps])];
         if (allSteps.length > 0) {
           output += `\nSteps:\n${allSteps.map(s => `  • ${s}`).join('\n')}\n`;
@@ -536,7 +454,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "comet_stop": {
-        const stopped = await cometAI.stopAgent();
+        const stopped = await cometClient.withAutomationMainTab(async () => cometAI.stopAgent());
         if (stopped) {
           sessionState.isActive = false;
         }
@@ -583,29 +501,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
 
           case 'close': {
-            // Safety check: don't close if it would leave no browsing tabs
-            const allTabs = await cometClient.getTabContexts();
-
-            // allTabs now only contains external tabs (Perplexity is filtered as internal)
-            if (allTabs.length <= 1) {
-              return { content: [{ type: "text", text: "Cannot close - this is the only browsing tab. Comet needs at least one external tab open." }], isError: true };
-            }
-
             if (tabId) {
-              const success = await cometClient.closeTab(tabId);
+              if (await cometClient.isAutomationMainTab(tabId)) {
+                return { content: [{ type: "text", text: "Cannot close the Perplexity control tab" }], isError: true };
+              }
+
+              const closableCount = await cometClient.getClosableTabCount();
+              if (closableCount <= 0) {
+                return { content: [{ type: "text", text: "Cannot close - no closable browsing tabs are open." }], isError: true };
+              }
+
+              const success = await cometClient.closeTrackedTab(tabId);
               return { content: [{ type: "text", text: success ? `Closed tab: ${tabId}` : `Failed to close tab` }] };
             }
+
             if (domain) {
               const tab = await cometClient.findTabByDomain(domain);
               if (tab && tab.purpose !== 'main') {
-                const success = await cometClient.closeTab(tab.id);
+                const success = await cometClient.closeTrackedTab(tab.id);
                 return { content: [{ type: "text", text: success ? `Closed ${tab.domain}` : `Failed to close tab` }] };
               }
               if (tab?.purpose === 'main') {
-                return { content: [{ type: "text", text: "Cannot close main Perplexity tab" }], isError: true };
+                return { content: [{ type: "text", text: "Cannot close the Perplexity control tab" }], isError: true };
               }
               return { content: [{ type: "text", text: `No tab found for domain: ${domain}` }], isError: true };
             }
+
             return { content: [{ type: "text", text: "Specify domain or tabId to close" }], isError: true };
           }
 
@@ -617,11 +538,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "comet_mode": {
         const mode = args?.mode as string | undefined;
 
-        // If no mode provided, show current mode
         if (!mode) {
-          const result = await cometClient.evaluate(`
+          const result = await cometClient.withAutomationMainTab(async () => cometClient.evaluate(`
             (() => {
-              // Try button group first (wide screen)
               const modes = ['Search', 'Research', 'Labs', 'Learn'];
               for (const mode of modes) {
                 const btn = document.querySelector('button[aria-label="' + mode + '"]');
@@ -629,7 +548,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   return mode.toLowerCase();
                 }
               }
-              // Try dropdown (narrow screen) - look for the mode selector button
               const dropdownBtn = document.querySelector('button[class*="gap"]');
               if (dropdownBtn) {
                 const text = dropdownBtn.innerText.toLowerCase();
@@ -640,7 +558,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }
               return 'search';
             })()
-          `);
+          `));
 
           const currentMode = result.result.value as string;
           const descriptions: Record<string, string> = {
@@ -659,7 +577,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: output }] };
         }
 
-        // Switch mode
         const modeMap: Record<string, string> = {
           search: "Search",
           research: "Research",
@@ -674,73 +591,117 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Navigate to Perplexity first if not there
-        const state = cometClient.currentState;
-        if (!state.currentUrl?.includes("perplexity.ai")) {
-          await cometClient.navigate("https://www.perplexity.ai/", true);
-        }
+        // Navigate to home page for mode switching (modes are on the main search page)
+        await cometClient.withAutomationMainTab(async () => {
+          const state = cometClient.currentState;
+          if (!state.currentUrl || !state.currentUrl.match(/perplexity\.ai\/?$/)) {
+            await cometClient.navigate("https://www.perplexity.ai/", true);
+            await new Promise(resolve => setTimeout(resolve, 1500));
+          }
+        });
 
-        // Try both UI patterns: button group (wide) and dropdown (narrow)
-        const result = await cometClient.evaluate(`
-          (() => {
-            // Strategy 1: Direct button (wide screen)
-            const btn = document.querySelector('button[aria-label="${ariaLabel}"]');
-            if (btn) {
-              btn.click();
-              return { success: true, method: 'button' };
-            }
-
-            // Strategy 2: Dropdown menu (narrow screen)
-            // Find and click the dropdown trigger (button with current mode text)
-            const allButtons = document.querySelectorAll('button');
-            for (const b of allButtons) {
-              const text = b.innerText.toLowerCase();
-              if ((text.includes('search') || text.includes('research') ||
-                   text.includes('labs') || text.includes('learn')) &&
-                  b.querySelector('svg')) {
-                b.click();
-                return { success: true, method: 'dropdown-open', needsSelect: true };
+        const result = await cometClient.withAutomationMainTab(async () => {
+          return cometClient.evaluate(`
+            (() => {
+              // Try direct aria-label buttons first (old UI)
+              const directBtn = document.querySelector('button[aria-label="${ariaLabel}"]');
+              if (directBtn) {
+                directBtn.click();
+                return { success: true, method: 'direct-button' };
               }
-            }
 
-            return { success: false, error: "Mode selector not found" };
-          })()
-        `);
+              // Try finding any button that could open a mode/model menu
+              const menuButton = [...document.querySelectorAll('button')].find(btn => {
+                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                const text = (btn.innerText || '').trim().toLowerCase();
+                return aria === 'model' || text === 'model' ||
+                       aria.includes('search mode') || aria.includes('focus') ||
+                       text === 'search' || text === 'research' || text === 'labs' || text === 'learn';
+              });
+
+              if (menuButton) {
+                // If this button IS the desired mode, just click it
+                const btnText = (menuButton.innerText || '').trim().toLowerCase();
+                if (btnText === '${mode}'.toLowerCase()) {
+                  menuButton.click();
+                  return { success: true, method: 'direct-mode-button' };
+                }
+                menuButton.click();
+                return { success: true, method: 'model-menu', needsSelect: true };
+              }
+
+              return { success: false, error: "Mode selector not found on page. Navigate to perplexity.ai first." };
+            })()
+          `);
+        });
 
         const clickResult = result.result.value as { success: boolean; method?: string; needsSelect?: boolean; error?: string };
 
         if (clickResult.success && clickResult.needsSelect) {
-          // Wait for dropdown to open, then select the mode
-          await new Promise(resolve => setTimeout(resolve, 300));
-          const selectResult = await cometClient.evaluate(`
-            (() => {
-              // Look for dropdown menu items
-              const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
-              for (const item of items) {
-                if (item.innerText.toLowerCase().includes('${mode}')) {
-                  item.click();
-                  return { success: true };
+          // Wait for dropdown/popover to render
+          await new Promise(resolve => setTimeout(resolve, 600));
+
+          // Try selecting the mode from the dropdown with retries
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const selectResult = await cometClient.withAutomationMainTab(async () => cometClient.evaluate(`
+              (() => {
+                const desired = '${mode}'.toLowerCase();
+                // Search for clickable elements matching the desired mode
+                // Use leaf-node links/buttons first (most specific), then broaden
+                const selectors = ['a', 'button', '[role="menuitem"]', '[role="option"]', 'div[role="button"]', 'label'];
+                for (const sel of selectors) {
+                  const items = [...document.querySelectorAll(sel)];
+                  for (const item of items) {
+                    const text = (item.innerText || '').trim().toLowerCase();
+                    const aria = (item.getAttribute?.('aria-label') || '').trim().toLowerCase();
+                    const rect = item.getBoundingClientRect();
+                    const isVisible = rect.height > 0 && rect.width > 0;
+                    // Match: exact text match or text starts with desired mode
+                    if (isVisible && text.length < 40 && (text === desired || aria === desired)) {
+                      item.click();
+                      return { success: true, matched: text || aria };
+                    }
+                  }
                 }
-              }
-              return { success: false, error: "Mode option not found in dropdown" };
-            })()
-          `);
-          const selectRes = selectResult.result.value as { success: boolean; error?: string };
-          if (selectRes.success) {
-            return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
-          } else {
-            return { content: [{ type: "text", text: `Failed: ${selectRes.error}` }], isError: true };
+                // Fallback: partial match (text starts with desired)
+                for (const sel of selectors) {
+                  const items = [...document.querySelectorAll(sel)];
+                  for (const item of items) {
+                    const text = (item.innerText || '').trim().toLowerCase();
+                    const aria = (item.getAttribute?.('aria-label') || '').trim().toLowerCase();
+                    const rect = item.getBoundingClientRect();
+                    const isVisible = rect.height > 0 && rect.width > 0;
+                    if (isVisible && text.length < 40 && (text.startsWith(desired) || aria.startsWith(desired))) {
+                      item.click();
+                      return { success: true, matched: text || aria };
+                    }
+                  }
+                }
+                // Debug info
+                const visibleLinks = [...document.querySelectorAll('a, button')].filter(e => e.getBoundingClientRect().height > 0).map(e => e.innerText.trim().substring(0, 30)).filter(t => t.length > 0 && t.length < 30);
+                return { success: false, error: "Mode option not found in dropdown", visibleOptions: visibleLinks.slice(0, 15).join(', ') };
+              })()
+            `));
+            const selectRes = selectResult.result.value as { success: boolean; error?: string; matched?: string; candidateCount?: number };
+            if (selectRes.success) {
+              return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
+            }
+            if (attempt < 2) {
+              await new Promise(resolve => setTimeout(resolve, 400));
+            } else {
+              return { content: [{ type: "text", text: `Failed: ${selectRes.error} (${selectRes.candidateCount} visible items checked)` }], isError: true };
+            }
           }
         }
 
         if (clickResult.success) {
           return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
-        } else {
-          return {
-            content: [{ type: "text", text: `Failed to switch mode: ${clickResult.error}` }],
-            isError: true,
-          };
         }
+
+        return {
+          content: [{ type: "text", text: `Failed to switch mode: ${clickResult.error}` }],
+          isError: true,
+        };
       }
 
       case "comet_upload": {
@@ -752,13 +713,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "Error: filePath is required" }], isError: true };
         }
 
-        // Check if file exists
         const fs = await import('fs');
         if (!fs.existsSync(filePath)) {
           return { content: [{ type: "text", text: `Error: File not found: ${filePath}` }], isError: true };
         }
 
-        // If checkOnly, just report what file inputs exist
         if (checkOnly) {
           const inputInfo = await cometClient.hasFileInput();
           if (inputInfo.found) {
@@ -766,29 +725,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             msg += inputInfo.selectors.map((s, i) => `  ${i + 1}. ${s}`).join('\n');
             msg += `\n\nUse comet_upload with filePath to upload to one of these inputs.`;
             return { content: [{ type: "text", text: msg }] };
-          } else {
-            return { content: [{ type: "text", text: "No file input elements found on the current page. Navigate to a page with a file upload form first." }] };
           }
+          return { content: [{ type: "text", text: "No file input elements found on the current page. Navigate to a page with a file upload form first." }] };
         }
 
-        // Perform the upload
         const result = await cometClient.uploadFile(filePath, selector);
 
         if (result.success) {
           return { content: [{ type: "text", text: result.message }] };
-        } else {
-          // If no input found, provide helpful info
-          if (!result.inputFound) {
-            const inputInfo = await cometClient.hasFileInput();
-            let msg = result.message;
-            if (inputInfo.found) {
-              msg += `\n\nAvailable file inputs:\n${inputInfo.selectors.map((s, i) => `  ${i + 1}. ${s}`).join('\n')}`;
-              msg += `\n\nTry specifying a selector parameter.`;
-            }
-            return { content: [{ type: "text", text: msg }], isError: true };
-          }
-          return { content: [{ type: "text", text: result.message }], isError: true };
         }
+
+        if (!result.inputFound) {
+          const inputInfo = await cometClient.hasFileInput();
+          let msg = result.message;
+          if (inputInfo.found) {
+            msg += `\n\nAvailable file inputs:\n${inputInfo.selectors.map((s, i) => `  ${i + 1}. ${s}`).join('\n')}`;
+            msg += `\n\nTry specifying a selector parameter.`;
+          }
+          return { content: [{ type: "text", text: msg }], isError: true };
+        }
+
+        return { content: [{ type: "text", text: result.message }], isError: true };
       }
 
       default:
