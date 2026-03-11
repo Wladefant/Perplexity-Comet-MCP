@@ -150,7 +150,7 @@ const DEFAULT_AUTOMATION_PROFILE = "ClaudeAutomation";
 type ProfileMode = 'isolated' | 'default';
 
 function getProfileMode(): ProfileMode {
-  return process.env.COMET_PROFILE_MODE === 'default' ? 'default' : 'isolated';
+  return process.env.COMET_PROFILE_MODE === 'isolated' ? 'isolated' : 'default';
 }
 
 function getProfileModeLabel(): string {
